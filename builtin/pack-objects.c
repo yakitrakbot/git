@@ -45,6 +45,7 @@
 #include "tree.h"
 #include "path-walk.h"
 #include "trace2.h"
+#include "zstd-compat.h"
 
 /*
  * Objects we are going to pack are collected in the `to_pack` structure.
@@ -359,12 +360,45 @@ static void *get_delta(struct object_entry *entry)
 			      &type, &size);
 	if (!buf)
 		die(_("unable to read %s"), oid_to_hex(&entry->idx.oid));
+
+#ifdef HAVE_ZSTD
+	/*
+	 * For .json.zst files, decompress before computing delta.
+	 * This must match what try_delta() does.
+	 */
+	if (entry->is_json_zst && is_zstd_content(buf, size)) {
+		size_t dec_size;
+		void *dec_buf = zstd_decompress(buf, size, &dec_size);
+		if (dec_buf) {
+			free(buf);
+			buf = dec_buf;
+			size = dec_size;
+		}
+	}
+#endif
+
 	base_buf = odb_read_object(the_repository->objects,
 				   &DELTA(entry)->idx.oid, &type,
 				   &base_size);
 	if (!base_buf)
 		die("unable to read %s",
 		    oid_to_hex(&DELTA(entry)->idx.oid));
+
+#ifdef HAVE_ZSTD
+	/*
+	 * Also decompress the base if it's a .json.zst file.
+	 */
+	if (DELTA(entry)->is_json_zst && is_zstd_content(base_buf, base_size)) {
+		size_t dec_size;
+		void *dec_buf = zstd_decompress(base_buf, base_size, &dec_size);
+		if (dec_buf) {
+			free(base_buf);
+			base_buf = dec_buf;
+			base_size = dec_size;
+		}
+	}
+#endif
+
 	delta_buf = diff_delta(base_buf, base_size,
 			       buf, size, &delta_size, 0);
 	/*
@@ -532,6 +566,22 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 			if (!buf)
 				die(_("unable to read %s"),
 				    oid_to_hex(&entry->idx.oid));
+#ifdef HAVE_ZSTD
+			/*
+			 * For .json.zst files, decompress the content before storing.
+			 * This allows delta compression to work efficiently on the
+			 * decompressed JSON text rather than the opaque zstd bytes.
+			 */
+			if (entry->is_json_zst && is_zstd_content(buf, size)) {
+				size_t dec_size;
+				void *dec_buf = zstd_decompress(buf, size, &dec_size);
+				if (dec_buf) {
+					free(buf);
+					buf = dec_buf;
+					size = dec_size;
+				}
+			}
+#endif
 		}
 		/*
 		 * make sure no cached delta data remains from a
@@ -744,6 +794,10 @@ static off_t write_object(struct hashfile *f,
 		to_reuse = 0;	/* explicit */
 	else if (!IN_PACK(entry))
 		to_reuse = 0;	/* can't reuse what we don't have */
+#ifdef HAVE_ZSTD
+	else if (entry->is_json_zst)
+		to_reuse = 0;	/* need to decompress .json.zst files */
+#endif
 	else if (oe_type(entry) == OBJ_REF_DELTA ||
 		 oe_type(entry) == OBJ_OFS_DELTA)
 				/* check_object() decided it for us ... */
@@ -1493,6 +1547,16 @@ static int no_try_delta(const char *path)
 	return 0;
 }
 
+static int is_json_zst_file(const char *name)
+{
+	size_t len;
+
+	if (!name)
+		return 0;
+	len = strlen(name);
+	return len > 9 && !strcmp(name + len - 9, ".json.zst");
+}
+
 /*
  * When adding an object, check whether we have already added it
  * to our packing list. If so, we can skip. However, if we are
@@ -1794,6 +1858,7 @@ static struct object_entry *create_object_entry(const struct object_id *oid,
 						uint32_t hash,
 						int exclude,
 						int no_try_delta,
+						int is_json_zst,
 						struct packed_git *found_pack,
 						off_t found_offset)
 {
@@ -1812,6 +1877,7 @@ static struct object_entry *create_object_entry(const struct object_id *oid,
 	}
 
 	entry->no_try_delta = no_try_delta;
+	entry->is_json_zst = is_json_zst;
 
 	return entry;
 }
@@ -1825,6 +1891,7 @@ static int add_object_entry(const struct object_id *oid, enum object_type type,
 {
 	struct packed_git *found_pack = NULL;
 	off_t found_offset = 0;
+	int json_zst;
 
 	display_progress(progress_state, ++nr_seen);
 
@@ -1841,8 +1908,10 @@ static int add_object_entry(const struct object_id *oid, enum object_type type,
 		return 0;
 	}
 
+	json_zst = name && is_json_zst_file(name);
 	create_object_entry(oid, type, pack_name_hash_fn(name),
 			    exclude, name && no_try_delta(name),
+			    json_zst,
 			    found_pack, found_offset);
 	return 1;
 }
@@ -1861,7 +1930,7 @@ static int add_object_entry_from_bitmap(const struct object_id *oid,
 	if (!want_object_in_pack(oid, 0, &pack, &offset))
 		return 0;
 
-	create_object_entry(oid, type, name_hash, 0, 0, pack, offset);
+	create_object_entry(oid, type, name_hash, 0, 0, 0, pack, offset);
 	return 1;
 }
 
@@ -2632,6 +2701,8 @@ static int type_size_sort(const void *_a, const void *_b)
 struct unpacked {
 	struct object_entry *entry;
 	void *data;
+	void *decompressed_data;    /* for .json.zst files, holds decompressed JSON */
+	unsigned long decompressed_size;
 	struct delta_index *index;
 	unsigned depth;
 };
@@ -2834,18 +2905,62 @@ static int try_delta(struct unpacked *trg, struct unpacked *src,
 			    (uintmax_t)src_size);
 		*mem_usage += sz;
 	}
-	if (!src->index) {
-		src->index = create_delta_index(src->data, src_size);
-		if (!src->index) {
-			static int warned = 0;
-			if (!warned++)
-				warning(_("suboptimal pack - out of memory"));
-			return 0;
+	/*
+	 * For .json.zst files, decompress the content before computing deltas.
+	 * This gives much better delta compression since the decompressed JSON
+	 * text is highly similar across versions, unlike the zstd-compressed bytes.
+	 */
+#ifdef HAVE_ZSTD
+	if (trg_entry->is_json_zst && !trg->decompressed_data) {
+		size_t dec_size;
+		trg->decompressed_data = zstd_decompress(trg->data, trg_size, &dec_size);
+		if (trg->decompressed_data) {
+			trg->decompressed_size = dec_size;
+			*mem_usage += dec_size;
 		}
-		*mem_usage += sizeof_delta_index(src->index);
 	}
+	if (src_entry->is_json_zst && !src->decompressed_data) {
+		size_t dec_size;
+		src->decompressed_data = zstd_decompress(src->data, src_size, &dec_size);
+		if (src->decompressed_data) {
+			src->decompressed_size = dec_size;
+			*mem_usage += dec_size;
+		}
+	}
+#endif
 
-	delta_buf = create_delta(src->index, trg->data, trg_size, &delta_size, max_size);
+	/*
+	 * Use decompressed data for delta computation if available.
+	 * Both src and trg must be decompressed for this to work correctly.
+	 */
+	{
+		void *src_buf = src->data;
+		unsigned long src_bufsize = src_size;
+		void *trg_buf = trg->data;
+		unsigned long trg_bufsize = trg_size;
+
+#ifdef HAVE_ZSTD
+		if (src->decompressed_data && trg->decompressed_data) {
+			src_buf = src->decompressed_data;
+			src_bufsize = src->decompressed_size;
+			trg_buf = trg->decompressed_data;
+			trg_bufsize = trg->decompressed_size;
+		}
+#endif
+
+		if (!src->index) {
+			src->index = create_delta_index(src_buf, src_bufsize);
+			if (!src->index) {
+				static int warned = 0;
+				if (!warned++)
+					warning(_("suboptimal pack - out of memory"));
+				return 0;
+			}
+			*mem_usage += sizeof_delta_index(src->index);
+		}
+
+		delta_buf = create_delta(src->index, trg_buf, trg_bufsize, &delta_size, max_size);
+	}
 	if (!delta_buf)
 		return 0;
 
@@ -2906,6 +3021,11 @@ static unsigned long free_unpacked(struct unpacked *n)
 	if (n->data) {
 		freed_mem += SIZE(n->entry);
 		FREE_AND_NULL(n->data);
+	}
+	if (n->decompressed_data) {
+		freed_mem += n->decompressed_size;
+		FREE_AND_NULL(n->decompressed_data);
+		n->decompressed_size = 0;
 	}
 	n->entry = NULL;
 	n->depth = 0;
@@ -3763,7 +3883,7 @@ static int add_object_entry_from_pack(const struct object_id *oid,
 		stdin_packs_found_nr++;
 	}
 
-	create_object_entry(oid, type, 0, 0, 0, p, ofs);
+	create_object_entry(oid, type, 0, 0, 0, 0, p, ofs);
 
 	return 0;
 }
@@ -4000,6 +4120,7 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 
 		entry = create_object_entry(oid, type, pack_name_hash_fn(name),
 					    0, name && no_try_delta(name),
+					    name && is_json_zst_file(name),
 					    pack, offset);
 	}
 

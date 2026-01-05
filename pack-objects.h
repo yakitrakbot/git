@@ -118,6 +118,7 @@ struct object_entry {
 	unsigned dfs_state:OE_DFS_STATE_BITS;
 	unsigned depth:OE_DEPTH_BITS;
 	unsigned ext_base:1; /* delta_idx points outside packlist */
+	unsigned is_json_zst:1; /* file is .json.zst, needs decompression */
 };
 
 /**
